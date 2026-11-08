@@ -1,0 +1,7 @@
+[tasks.install]
+description = "Install the app"
+run = "cargo install --path ."
+
+[tasks.test-phone]
+description = "Run the end-to-end tests against a connected phone"
+run = "cargo test --test phone -- --ignored"
