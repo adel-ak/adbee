@@ -249,6 +249,7 @@ fn open(serial: &str) -> ADBServerDevice {
 
 pub fn devices() -> Result<()> {
     watch();
+    tidy_duplicates();
     let mut cards: Vec<Card> = Vec::new();
     for (serial, state) in list()? {
         let details = if matches!(state, DeviceState::Device) {
@@ -272,9 +273,38 @@ pub fn devices() -> Result<()> {
     Ok(())
 }
 
+/// adb lists a phone twice when adbee connected it by IP and adb's own auto-connect followed
+/// later under the mDNS name. Drop the IP connection, keep adb's, and say so. Only connections
+/// to the same hardware (same `ro.serialno`) count; nothing happens if any check fails.
+fn tidy_duplicates() {
+    let Ok(listed) = list() else { return };
+    let ready: Vec<&str> = listed
+        .iter()
+        .filter(|(_, state)| matches!(state, DeviceState::Device))
+        .map(|(serial, _)| serial.as_str())
+        .collect();
+    let by_ip: Vec<&str> = ready.iter().copied().filter(|s| s.parse::<std::net::SocketAddr>().is_ok()).collect();
+    let by_name: Vec<&str> = ready.iter().copied().filter(|s| s.contains("._adb-tls-connect.")).collect();
+    if by_ip.is_empty() || by_name.is_empty() {
+        return;
+    }
+    let hardware = |serial: &str| {
+        sh(&mut open(serial), "getprop ro.serialno").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    };
+    let named: HashSet<String> = by_name.iter().filter_map(|s| hardware(s)).collect();
+    for ip in by_ip {
+        if hardware(ip).is_some_and(|h| named.contains(&h)) && crate::adb(&["disconnect", ip], "disconnected").is_ok() {
+            eprintln!("Removed duplicate connection {ip} (adb also has this phone under its own name)");
+        }
+    }
+}
+
 /// The device to act on: `serial` if given, the only one connected, or ask (when `ask` and a terminal).
 pub fn pick(serial: Option<String>, ask: bool) -> Result<ADBServerDevice> {
     watch();
+    if ask {
+        tidy_duplicates(); // not while completing: Tab shouldn't change connections
+    }
     let listed = list()?;
     if let Some(serial) = serial {
         if !listed.iter().any(|(s, _)| *s == serial) {
@@ -448,7 +478,7 @@ pub fn pull(dev: &mut ADBServerDevice, remote: &str, local: &Path) -> Result<()>
 }
 
 pub fn ls(dev: &mut ADBServerDevice, path: &str) -> Result<()> {
-    print!("{}", sh(dev, &format!("ls -la {}", quote(path)))?);
+    print!("{}", sh(dev, &format!("ls -laH {}", quote(path)))?);
     Ok(())
 }
 

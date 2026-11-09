@@ -9,8 +9,6 @@ const PAIRING: &str = "_adb-tls-pairing._tcp.local.";
 const CONNECT: &str = "_adb-tls-connect._tcp.local.";
 const PAIR_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long to let adb auto-connect a freshly paired phone before connecting it ourselves.
-const AUTO_CONNECT_WAIT: Duration = Duration::from_secs(5);
 /// How long to wait when checking that something listens on an announced port.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -84,7 +82,7 @@ pub fn pair_qr() -> Result<()> {
     let svc = discover(PAIRING, PAIR_TIMEOUT, |svc| svc.get_fullname().starts_with(&prefix))?;
     let addr = best_addr(&svc)?;
     pair_at(addr, &password)?;
-    connect_discovered(Some(addr.ip()), AUTO_CONNECT_WAIT)
+    connect_discovered(Some(addr.ip()))
 }
 
 /// Pair by typing the code shown on the phone. `addr` skips discovery, for networks that block mDNS.
@@ -103,7 +101,7 @@ pub fn pair_code(addr: Option<SocketAddr>) -> Result<()> {
         })
         .run()?;
     pair_at(addr, &code)?;
-    connect_discovered(Some(addr.ip()), AUTO_CONNECT_WAIT)
+    connect_discovered(Some(addr.ip()))
 }
 
 /// Connect to a paired phone over WiFi.
@@ -116,16 +114,11 @@ pub fn connect(target: Option<&str>) -> Result<()> {
         .map(str::parse::<IpAddr>)
         .transpose()
         .map_err(|_| "expected an IP address or IP:port")?;
-    connect_discovered(ip, Duration::ZERO)
+    connect_discovered(ip)
 }
 
-/// Find the phone on the network and connect it, unless adb does so itself within `wait`.
-///
-/// Recent adb servers auto-connect paired phones under their mDNS name. Connecting by IP as
-/// well lists the same phone twice, so give adb the first chance; right after pairing it needs
-/// a moment, which is what `wait` is for. Connecting by IP stays as the fallback for adb
-/// servers without auto-connect.
-fn connect_discovered(ip: Option<IpAddr>, wait: Duration) -> Result<()> {
+/// Find the phone on the network and connect it, unless adb already has it.
+fn connect_discovered(ip: Option<IpAddr>) -> Result<()> {
     // Phones keep announcing an old name for a while after wireless debugging restarts (here:
     // `adb-XXXX` on a closed port next to the live `adb-XXXX (2)`), so skip announcements
     // nothing is listening on.
@@ -134,22 +127,23 @@ fn connect_discovered(ip: Option<IpAddr>, wait: Duration) -> Result<()> {
             && best_addr(svc).is_ok_and(|addr| TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok())
     })?;
     let name = svc.get_fullname().trim_end_matches(".local.");
-    let deadline = Instant::now() + wait;
-    loop {
-        let listed = crate::device::list()?;
-        let connected = listed
-            .iter()
-            .find(|(s, state)| matches!(state, DeviceState::Device) && same_phone(s, name));
-        if let Some((serial, _)) = connected {
-            println!("Connected: {serial}");
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(250));
+    if let Some(serial) = connected_as(name)? {
+        println!("Already connected: {serial}");
+        return Ok(());
     }
+    // adb may still connect the phone by itself later, under its mDNS name, whenever its retry
+    // timer fires (15-40s after a re-pair). There's no way to hurry or stop that, and adb 37
+    // can't connect by name, so connect by IP now; the next adbee command drops whichever
+    // connection turns out to be the duplicate (device::tidy_duplicates).
     connect_at(best_addr(&svc)?)
+}
+
+/// adb's serial for the phone announced as `name`, if adb has it connected.
+fn connected_as(name: &str) -> Result<Option<String>> {
+    Ok(crate::device::list()?
+        .into_iter()
+        .find(|(s, state)| matches!(state, DeviceState::Device) && same_phone(s, name))
+        .map(|(serial, _)| serial))
 }
 
 /// The mDNS instance name without the ` (2)` a name clash adds: `adb-XXXX (2)._adb-tls-connect._tcp`
@@ -198,6 +192,8 @@ mod tests {
         assert!(same_phone(auto, "adb-ABC123-4kKTKP (2)._adb-tls-connect._tcp"));
         assert!(!same_phone(auto, "adb-OTHER-zzzzzz._adb-tls-connect._tcp"));
         assert!(!same_phone("192.168.1.20:37001", "adb-ABC123-4kKTKP._adb-tls-connect._tcp"));
+        // `adb mdns services` lists bare instance names.
+        assert_eq!(base_name("adb-ABC123-4kKTKP (2)"), base_name(auto));
     }
 
     #[test]
