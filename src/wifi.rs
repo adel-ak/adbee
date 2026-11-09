@@ -2,7 +2,7 @@ use crate::Result;
 use adb_client::server::DeviceState;
 use mdns_sd::{ResolvedService, ScopedIp, ServiceDaemon, ServiceEvent};
 use rand::Rng;
-use std::net::{IpAddr, SocketAddr, SocketAddrV6};
+use std::net::{IpAddr, SocketAddr, SocketAddrV6, TcpStream};
 use std::time::{Duration, Instant};
 
 const PAIRING: &str = "_adb-tls-pairing._tcp.local.";
@@ -11,6 +11,8 @@ const PAIR_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to let adb auto-connect a freshly paired phone before connecting it ourselves.
 const AUTO_CONNECT_WAIT: Duration = Duration::from_secs(5);
+/// How long to wait when checking that something listens on an announced port.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn random_code() -> String {
     rand::thread_rng().gen_range(100_000..1_000_000).to_string()
@@ -124,14 +126,22 @@ pub fn connect(target: Option<&str>) -> Result<()> {
 /// a moment, which is what `wait` is for. Connecting by IP stays as the fallback for adb
 /// servers without auto-connect.
 fn connect_discovered(ip: Option<IpAddr>, wait: Duration) -> Result<()> {
+    // Phones keep announcing an old name for a while after wireless debugging restarts (here:
+    // `adb-XXXX` on a closed port next to the live `adb-XXXX (2)`), so skip announcements
+    // nothing is listening on.
     let svc = discover(CONNECT, CONNECT_TIMEOUT, |svc| {
         ip.is_none_or(|ip| svc.get_addresses().iter().any(|a| a.to_ip_addr() == ip))
+            && best_addr(svc).is_ok_and(|addr| TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok())
     })?;
     let name = svc.get_fullname().trim_end_matches(".local.");
     let deadline = Instant::now() + wait;
     loop {
-        if crate::device::list()?.iter().any(|(s, state)| s == name && matches!(state, DeviceState::Device)) {
-            println!("Connected: {name}");
+        let listed = crate::device::list()?;
+        let connected = listed
+            .iter()
+            .find(|(s, state)| matches!(state, DeviceState::Device) && same_phone(s, name));
+        if let Some((serial, _)) = connected {
+            println!("Connected: {serial}");
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -140,6 +150,21 @@ fn connect_discovered(ip: Option<IpAddr>, wait: Duration) -> Result<()> {
         std::thread::sleep(Duration::from_millis(250));
     }
     connect_at(best_addr(&svc)?)
+}
+
+/// The mDNS instance name without the ` (2)` a name clash adds: `adb-XXXX (2)._adb-tls-connect._tcp`
+/// and `adb-XXXX._adb-tls-connect._tcp` are the same phone.
+fn base_name(name: &str) -> &str {
+    let instance = name.split("._adb-tls-connect.").next().unwrap_or(name);
+    match instance.rfind(" (") {
+        Some(i) if instance.ends_with(')') => &instance[..i],
+        _ => instance,
+    }
+}
+
+/// Whether adb's serial `serial` is the mDNS-connected phone announced as `name`.
+fn same_phone(serial: &str, name: &str) -> bool {
+    serial.contains("._adb-tls-connect.") && base_name(serial) == base_name(name)
 }
 
 fn connect_at(addr: SocketAddr) -> Result<()> {
@@ -165,6 +190,15 @@ pub fn disconnect(target: Option<&str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn treats_a_renamed_announcement_as_the_same_phone() {
+        let auto = "adb-ABC123-4kKTKP (2)._adb-tls-connect._tcp";
+        assert!(same_phone(auto, "adb-ABC123-4kKTKP._adb-tls-connect._tcp"));
+        assert!(same_phone(auto, "adb-ABC123-4kKTKP (2)._adb-tls-connect._tcp"));
+        assert!(!same_phone(auto, "adb-OTHER-zzzzzz._adb-tls-connect._tcp"));
+        assert!(!same_phone("192.168.1.20:37001", "adb-ABC123-4kKTKP._adb-tls-connect._tcp"));
+    }
 
     #[test]
     fn prefers_ipv4_then_routable_ipv6() {
