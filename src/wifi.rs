@@ -3,6 +3,7 @@ use adb_client::server::DeviceState;
 use mdns_sd::{ResolvedService, ScopedIp, ServiceDaemon, ServiceEvent};
 use rand::Rng;
 use std::net::{IpAddr, SocketAddr, SocketAddrV6, TcpStream};
+use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
 const PAIRING: &str = "_adb-tls-pairing._tcp.local.";
@@ -11,29 +12,85 @@ const PAIR_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to wait when checking that something listens on an announced port.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+/// After the first phone answers, how long to keep listening for others.
+const GATHER: Duration = Duration::from_secs(2);
 
 fn random_code() -> String {
     rand::thread_rng().gen_range(100_000..1_000_000).to_string()
 }
 
-/// Wait up to `timeout` for a resolved mDNS `service` that `want` accepts.
+/// Every phone announcing `service` that `want` accepts: waits up to `timeout` for the first,
+/// then `gather` longer for any others.
+fn discover_all(
+    service: &str,
+    timeout: Duration,
+    gather: Duration,
+    want: impl Fn(&ResolvedService) -> bool,
+) -> Result<Vec<ResolvedService>> {
+    let mdns = ServiceDaemon::new()?;
+    let events = mdns.browse(service)?;
+    let mut deadline = Instant::now() + timeout;
+    let mut found: Vec<ResolvedService> = Vec::new();
+    while let Ok(event) = events.recv_deadline(deadline) {
+        if let ServiceEvent::ServiceResolved(svc) = event {
+            if want(&svc) && !found.iter().any(|f| f.get_fullname() == svc.get_fullname()) {
+                if found.is_empty() {
+                    deadline = Instant::now() + gather;
+                }
+                found.push(*svc);
+            }
+        }
+    }
+    mdns.shutdown().ok();
+    if found.is_empty() {
+        return Err(format!("no device found within {}s", timeout.as_secs()).into());
+    }
+    Ok(found)
+}
+
+/// The first phone announcing `service` that `want` accepts, waiting up to `timeout`.
 fn discover(
     service: &str,
     timeout: Duration,
     want: impl Fn(&ResolvedService) -> bool,
-) -> Result<Box<ResolvedService>> {
-    let mdns = ServiceDaemon::new()?;
-    let events = mdns.browse(service)?;
-    let deadline = Instant::now() + timeout;
-    let found = loop {
-        match events.recv_deadline(deadline) {
-            Ok(ServiceEvent::ServiceResolved(svc)) if want(&svc) => break Ok(svc),
-            Ok(_) => {}
-            Err(_) => break Err(format!("no device found within {}s", timeout.as_secs()).into()),
-        }
-    };
-    mdns.shutdown().ok();
-    found
+) -> Result<ResolvedService> {
+    Ok(discover_all(service, timeout, Duration::ZERO, want)?.remove(0))
+}
+
+/// Whether something listens on the announced port. Phones keep announcing an old name for a
+/// while after wireless debugging restarts (`adb-XXXX` on a closed port next to the live
+/// `adb-XXXX (2)`); this skips those.
+fn reachable(svc: &ResolvedService) -> bool {
+    best_addr(svc).is_ok_and(|addr| TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok())
+}
+
+/// Which of `items` to act on: all of them with `all`, the only one, or a checkbox list (space/x
+/// toggles one, `a` toggles all). Without a terminal to ask on, several items are an error that
+/// says what to pass instead.
+fn choose<T>(items: Vec<T>, all: bool, title: &str, label: impl Fn(&T) -> String, hint: &str) -> Result<Vec<T>> {
+    if all || items.len() <= 1 {
+        return Ok(items);
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(format!("several found; {hint}").into());
+    }
+    crate::device::pause_watch();
+    let options = items.iter().enumerate().map(|(i, item)| demand::DemandOption::new(i).label(&label(item))).collect();
+    let picked = demand::MultiSelect::new(title)
+        .description("space to tick, a for all, enter to confirm")
+        .options(options)
+        .min(1)
+        .run()?;
+    Ok(items.into_iter().enumerate().filter(|(i, _)| picked.contains(i)).map(|(_, item)| item).collect())
+}
+
+/// "SM-N986B · 192.168.1.66" for a phone's connect announcement.
+fn phone_label(svc: &ResolvedService) -> String {
+    let model = svc.get_property_val_str("name").unwrap_or("phone");
+    match best_addr(svc) {
+        Ok(addr) => format!("{model} · {}", addr.ip()),
+        Err(_) => model.to_string(),
+    }
 }
 
 /// IPv4 first, then routable IPv6, then link-local IPv6.
@@ -91,7 +148,7 @@ pub fn pair_code(addr: Option<SocketAddr>) -> Result<()> {
         Some(addr) => addr,
         None => {
             eprintln!("On your phone: Developer options → Wireless debugging → Pair device with pairing code");
-            best_addr(&*discover(PAIRING, PAIR_TIMEOUT, |_| true)?)?
+            best_addr(&discover(PAIRING, PAIR_TIMEOUT, |_| true)?)?
         }
     };
     let code = demand::Input::new(format!("Pairing code for {addr}"))
@@ -104,9 +161,13 @@ pub fn pair_code(addr: Option<SocketAddr>) -> Result<()> {
     connect_discovered(Some(addr.ip()))
 }
 
-/// Connect to a paired phone over WiFi.
-/// `target`: nothing (first paired phone found), an IP (that phone), or IP:port (directly, no discovery).
-pub fn connect(target: Option<&str>) -> Result<()> {
+/// Connect paired phones over WiFi. `target`: nothing (every paired phone found: one is
+/// connected, several are offered in a menu with "All"), an IP (that phone), or IP:port
+/// (directly, no discovery). `all` connects every phone found without asking.
+pub fn connect(target: Option<&str>, all: bool) -> Result<()> {
+    if all && target.is_some() {
+        return Err("pass either a phone or --all, not both".into());
+    }
     if let Some(Ok(addr)) = target.map(str::parse::<SocketAddr>) {
         return connect_at(addr);
     }
@@ -114,17 +175,38 @@ pub fn connect(target: Option<&str>) -> Result<()> {
         .map(str::parse::<IpAddr>)
         .transpose()
         .map_err(|_| "expected an IP address or IP:port")?;
-    connect_discovered(ip)
+    let phones = discover_all(CONNECT, CONNECT_TIMEOUT, GATHER, |svc| {
+        ip.is_none_or(|ip| svc.get_addresses().iter().any(|a| a.to_ip_addr() == ip)) && reachable(svc)
+    })?;
+    let mut todo = Vec::new();
+    for svc in phones {
+        match connected_as(svc.get_fullname().trim_end_matches(".local."))? {
+            Some(serial) => println!("Already connected: {serial}"),
+            None => todo.push(svc),
+        }
+    }
+    let chosen = choose(todo, all, "Connect which phones?", phone_label, "name one (IP or IP:port) or pass --all")?;
+    let mut failed = 0;
+    for svc in chosen {
+        // adb may still connect the phone by itself later, under its mDNS name, whenever its
+        // retry timer fires (15-40s after a re-pair). There's no way to hurry or stop that, and
+        // adb 37 can't connect by name, so connect by IP now; the next adbee command drops
+        // whichever connection turns out to be the duplicate (device::tidy_duplicates).
+        if let Err(e) = best_addr(&svc).and_then(connect_at) {
+            eprintln!("adbee: {e}");
+            failed += 1;
+        }
+    }
+    if failed > 0 {
+        return Err(format!("{failed} phone(s) didn't connect").into());
+    }
+    Ok(())
 }
 
-/// Find the phone on the network and connect it, unless adb already has it.
+/// After pairing: find the phone at `ip` on the network and connect it, unless adb already has it.
 fn connect_discovered(ip: Option<IpAddr>) -> Result<()> {
-    // Phones keep announcing an old name for a while after wireless debugging restarts (here:
-    // `adb-XXXX` on a closed port next to the live `adb-XXXX (2)`), so skip announcements
-    // nothing is listening on.
     let svc = discover(CONNECT, CONNECT_TIMEOUT, |svc| {
-        ip.is_none_or(|ip| svc.get_addresses().iter().any(|a| a.to_ip_addr() == ip))
-            && best_addr(svc).is_ok_and(|addr| TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok())
+        ip.is_none_or(|ip| svc.get_addresses().iter().any(|a| a.to_ip_addr() == ip)) && reachable(svc)
     })?;
     let name = svc.get_fullname().trim_end_matches(".local.");
     if let Some(serial) = connected_as(name)? {
@@ -172,12 +254,28 @@ fn connect_at(addr: SocketAddr) -> Result<()> {
     Ok(())
 }
 
-/// Disconnect one wireless device (serial or IP:port), or all of them.
-pub fn disconnect(target: Option<&str>) -> Result<()> {
-    let mut args = vec!["disconnect"];
-    args.extend(target);
-    // Prints "disconnected <target>" or "disconnected everything".
-    println!("{}", crate::adb(&args, "disconnected")?);
+/// Disconnect a wireless device: `target` (serial or IP:port), every one with `all`, or else the
+/// only one connected, or one picked from a menu that also offers "All".
+pub fn disconnect(target: Option<&str>, all: bool) -> Result<()> {
+    if all && target.is_some() {
+        return Err("pass either a device or --all, not both".into());
+    }
+    if let Some(target) = target {
+        println!("{}", crate::adb(&["disconnect", target], "disconnected")?);
+        return Ok(());
+    }
+    if all {
+        println!("{}", crate::adb(&["disconnect"], "disconnected")?); // "disconnected everything"
+        return Ok(());
+    }
+    let wireless = crate::device::wireless()?;
+    if wireless.is_empty() {
+        return Err("no wireless devices connected".into());
+    }
+    let label = |(serial, model): &(String, String)| format!("{model} · {serial}");
+    for (serial, _) in choose(wireless, false, "Disconnect which devices?", label, "name one or pass --all")? {
+        println!("{}", crate::adb(&["disconnect", &serial], "disconnected")?);
+    }
     Ok(())
 }
 
@@ -194,6 +292,17 @@ mod tests {
         assert!(!same_phone("192.168.1.20:37001", "adb-ABC123-4kKTKP._adb-tls-connect._tcp"));
         // `adb mdns services` lists bare instance names.
         assert_eq!(base_name("adb-ABC123-4kKTKP (2)"), base_name(auto));
+    }
+
+    #[test]
+    fn chooses_without_asking_when_it_can() {
+        let label = |n: &u8| n.to_string();
+        assert_eq!(choose(vec![1, 2, 3], true, "", label, "").unwrap(), [1, 2, 3]);
+        assert_eq!(choose(vec![7], false, "", label, "").unwrap(), [7]);
+        assert!(choose(Vec::<u8>::new(), false, "", label, "").unwrap().is_empty());
+        // `cargo test` has no terminal on stdin, so several can't be asked about.
+        let err = choose(vec![1, 2], false, "", label, "pass --all").unwrap_err();
+        assert_eq!(err.to_string(), "several found; pass --all");
     }
 
     #[test]

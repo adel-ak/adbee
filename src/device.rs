@@ -330,7 +330,7 @@ pub fn pick(serial: Option<String>, ask: bool) -> Result<ADBServerDevice> {
         0 => return Err("no device connected (try `adbee devices`)".into()),
         1 => ids.remove(0),
         _ if ask && std::io::stdin().is_terminal() => {
-            LAST_REPLY.store(u64::MAX, Ordering::Relaxed); // waiting on you, not the device
+            pause_watch(); // waiting on you, not the device
             demand::Select::new("Which device?")
                 .options(ids.into_iter().map(demand::DemandOption::new).collect())
                 .run()?
@@ -341,21 +341,42 @@ pub fn pick(serial: Option<String>, ask: bool) -> Result<ADBServerDevice> {
     Ok(open(&id))
 }
 
+/// A device's model, or its adb state when it can't be asked.
+fn describe(serial: &str, state: &DeviceState) -> String {
+    matches!(state, DeviceState::Device)
+        .then(|| sh(&mut open(serial), "getprop ro.product.model").ok())
+        .flatten()
+        .map(|m| m.trim().to_string())
+        .unwrap_or_else(|| state.to_string())
+}
+
 /// Tab completion: connected devices and what they are.
 pub fn complete_serials() -> Vec<(String, String)> {
     watch();
     let Ok(listed) = list() else { return vec![] };
-    listed
+    listed.into_iter().map(|(serial, state)| {
+        let model = describe(&serial, &state);
+        (serial, model)
+    }).collect()
+}
+
+/// Wireless connections adb has (duplicates tidied first), each with its model.
+pub fn wireless() -> Result<Vec<(String, String)>> {
+    watch();
+    tidy_duplicates();
+    Ok(list()?
         .into_iter()
+        .filter(|(serial, _)| serial.contains(':') || serial.contains("._adb-tls-connect."))
         .map(|(serial, state)| {
-            let model = matches!(state, DeviceState::Device)
-                .then(|| sh(&mut open(&serial), "getprop ro.product.model").ok())
-                .flatten()
-                .map(|m| m.trim().to_string())
-                .unwrap_or_else(|| state.to_string());
+            let model = describe(&serial, &state);
             (serial, model)
         })
-        .collect()
+        .collect())
+}
+
+/// Stop the watchdog from firing while adbee waits on the user rather than on a device.
+pub fn pause_watch() {
+    LAST_REPLY.store(u64::MAX, Ordering::Relaxed);
 }
 
 /// Tab completion: what's in the device folder `prefix` is being typed into, as (path, is folder).

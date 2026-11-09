@@ -33,8 +33,8 @@ You need [Android platform-tools](https://developer.android.com/tools/releases/p
 | `adbee screenshot [file]` | Save a screenshot as PNG |
 | `adbee` or `adbee pair` | Pair over WiFi by scanning a QR code, then connect |
 | `adbee pair --code [ip:port]` | Pair by typing the 6-digit code shown on the phone |
-| `adbee connect [ip\|ip:port]` | Reconnect to an already-paired phone over WiFi |
-| `adbee disconnect [serial\|ip:port]` | Disconnect a wireless device, or all of them |
+| `adbee connect [ip\|ip:port] [--all]` | Reconnect paired phones over WiFi; pick from a checklist when several are around (or `--all`) |
+| `adbee disconnect [serial\|ip:port] [--all]` | Disconnect a wireless device; pick from a checklist when several are connected (or `--all`) |
 | `adbee completion <shell>` | Tab completion for commands, device serials, and file paths on the phone (`--install` to set it up) |
 
 With several devices connected, pick one with `-s <serial>` or `ANDROID_SERIAL`, or choose from the menu adbee shows.

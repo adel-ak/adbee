@@ -101,18 +101,25 @@ struct Pair {
     addr: Option<SocketAddr>,
 }
 
-/// Reconnect to an already-paired phone over WiFi
+/// Reconnect already-paired phones over WiFi (a checklist when several are around)
 #[derive(Args)]
 struct Connect {
     /// An IP address to pick that phone, or IP:port to connect without discovery
     target: Option<String>,
+    /// Connect every paired phone found, without asking
+    #[usage(long)]
+    all: bool,
 }
 
-/// Disconnect a wireless device (all of them if none is named)
+/// Disconnect wireless devices (a checklist when several are connected)
 #[derive(Args)]
 struct Disconnect {
     /// Serial (from `adbee devices`) or IP:port; defaults to --serial/ANDROID_SERIAL
+    #[usage(complete = complete_serial)]
     target: Option<String>,
+    /// Disconnect every wireless device, without asking
+    #[usage(long)]
+    all: bool,
 }
 
 /// `-s/--serial` as typed on the line being completed, else ANDROID_SERIAL.
@@ -174,8 +181,8 @@ fn run(Adbee { device: DeviceArg { serial }, command }: Adbee) -> Result<()> {
         Command::Screenshot(a) => device::screenshot(&mut device::pick(serial, true)?, a.output.as_deref()),
         Command::Pair(a) if a.code || a.addr.is_some() => wifi::pair_code(a.addr),
         Command::Pair(_) => wifi::pair_qr(),
-        Command::Connect(a) => wifi::connect(a.target.as_deref()),
-        Command::Disconnect(a) => wifi::disconnect(a.target.as_deref().or(serial.as_deref())),
+        Command::Connect(a) => wifi::connect(a.target.as_deref(), a.all),
+        Command::Disconnect(a) => wifi::disconnect(a.target.as_deref().or(serial.as_deref()), a.all),
         Command::Completion(c) => Ok(c.run("adbee", &mut std::io::stdout())?),
     }
 }
