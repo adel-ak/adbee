@@ -1,5 +1,5 @@
 use crate::Result;
-use adb_client::server::{ADBServer, DeviceState};
+use adb_client::server::DeviceState;
 use adb_client::server_device::ADBServerDevice;
 use adb_client::{ADBDeviceExt, ADBListItemType};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -221,23 +221,47 @@ impl Card {
     }
 }
 
+/// `adb devices` as (serial, state). Parsed here because adb_client's parser rejects serials
+/// containing spaces, which adb uses after an mDNS name clash (`adb-XXXX (2)._adb-tls-connect._tcp`),
+/// and then fails every call that lists devices.
+pub fn list() -> Result<Vec<(String, DeviceState)>> {
+    Ok(parse_devices(&crate::adb(&["devices"], "List of devices attached")?))
+}
+
+fn parse_devices(out: &str) -> Vec<(String, DeviceState)> {
+    out.lines()
+        .filter_map(|line| line.split_once('\t'))
+        .map(|(serial, state)| {
+            let state = state.trim();
+            let parsed = state.parse().unwrap_or(if state.starts_with("no permissions") {
+                DeviceState::NoPerm
+            } else {
+                DeviceState::Offline
+            });
+            (serial.to_string(), parsed)
+        })
+        .collect()
+}
+
+fn open(serial: &str) -> ADBServerDevice {
+    ADBServerDevice::new(serial.to_string(), None)
+}
+
 pub fn devices() -> Result<()> {
     watch();
-    let mut server = ADBServer::default();
     let mut cards: Vec<Card> = Vec::new();
-    for d in server.devices()? {
-        let details = if matches!(d.state, DeviceState::Device) {
-            let mut dev = server.get_device_by_name(&d.identifier)?;
+    for (serial, state) in list()? {
+        let details = if matches!(state, DeviceState::Device) {
             // ponytail: details are best effort, a device that refuses shows fewer lines
-            parse_details(&sh(&mut dev, DETAILS).unwrap_or_default())
+            parse_details(&sh(&mut open(&serial), DETAILS).unwrap_or_default())
         } else {
             Details::new()
         };
         // adb can list one phone twice (USB + WiFi, or auto-connect + `adb connect`): merge by hardware serial.
         let same = details.get("serial").and_then(|s| cards.iter_mut().find(|c| c.details.get("serial") == Some(s)));
         match same {
-            Some(card) => card.serials.push(d.identifier),
-            None => cards.push(Card { state: d.state, details, serials: vec![d.identifier] }),
+            Some(card) => card.serials.push(serial),
+            None => cards.push(Card { state, details, serials: vec![serial] }),
         }
     }
     if cards.is_empty() {
@@ -251,22 +275,24 @@ pub fn devices() -> Result<()> {
 /// The device to act on: `serial` if given, the only one connected, or ask (when `ask` and a terminal).
 pub fn pick(serial: Option<String>, ask: bool) -> Result<ADBServerDevice> {
     watch();
-    let mut server = ADBServer::default();
+    let listed = list()?;
     if let Some(serial) = serial {
-        return Ok(server.get_device_by_name(&serial)?);
+        if !listed.iter().any(|(s, _)| *s == serial) {
+            return Err(format!("no device {serial} (see `adbee devices`)").into());
+        }
+        return Ok(open(&serial));
     }
-    let mut ids: Vec<String> = server
-        .devices()?
+    let mut ids: Vec<String> = listed
         .into_iter()
-        .filter(|d| matches!(d.state, DeviceState::Device))
-        .map(|d| d.identifier)
+        .filter(|(_, state)| matches!(state, DeviceState::Device))
+        .map(|(serial, _)| serial)
         .collect();
     if ids.len() > 1 {
         // One phone can be listed twice (USB + WiFi, or adb's auto-connect + a manual
         // `adb connect`); keep the first entry per hardware serial.
         let mut seen = HashSet::new();
         ids.retain(|id| {
-            let serial = server.get_device_by_name(id).ok().and_then(|mut d| sh(&mut d, "getprop ro.serialno").ok());
+            let serial = sh(&mut open(id), "getprop ro.serialno").ok();
             serial.is_none_or(|s| seen.insert(s.trim().to_string()))
         });
     }
@@ -282,24 +308,22 @@ pub fn pick(serial: Option<String>, ask: bool) -> Result<ADBServerDevice> {
         _ => return Err("several devices connected; choose one with --serial or ANDROID_SERIAL".into()),
     };
     alive();
-    Ok(server.get_device_by_name(&id)?)
+    Ok(open(&id))
 }
 
 /// Tab completion: connected devices and what they are.
 pub fn complete_serials() -> Vec<(String, String)> {
     watch();
-    let mut server = ADBServer::default();
-    let Ok(devices) = server.devices() else { return vec![] };
-    devices
+    let Ok(listed) = list() else { return vec![] };
+    listed
         .into_iter()
-        .map(|d| {
-            let model = matches!(d.state, DeviceState::Device)
-                .then(|| server.get_device_by_name(&d.identifier).ok())
+        .map(|(serial, state)| {
+            let model = matches!(state, DeviceState::Device)
+                .then(|| sh(&mut open(&serial), "getprop ro.product.model").ok())
                 .flatten()
-                .and_then(|mut dev| sh(&mut dev, "getprop ro.product.model").ok())
                 .map(|m| m.trim().to_string())
-                .unwrap_or_else(|| d.state.to_string());
-            (d.identifier, model)
+                .unwrap_or_else(|| state.to_string());
+            (serial, model)
         })
         .collect()
 }
@@ -469,6 +493,20 @@ mod tests {
         // A device that answers nothing still gets a card.
         let bare = Card { state: DeviceState::Unauthorized, details: parse_details(""), serials: vec!["ABC123".into()] };
         assert_eq!(bare.render(), "● ABC123  unauthorized: allow debugging on the phone\n  Via       usb\n");
+    }
+
+    #[test]
+    fn parses_adb_devices_including_serials_with_spaces() {
+        let out = "List of devices attached\n\
+            adb-ABC123-4kKTKP (2)._adb-tls-connect._tcp\tdevice\n\
+            emulator-5554\toffline\n\
+            0123456789\tno permissions (missing udev rules); see [http://developer.android.com/tools/device.html]\n\n";
+        let listed = parse_devices(out);
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed[0].0, "adb-ABC123-4kKTKP (2)._adb-tls-connect._tcp");
+        assert!(matches!(listed[0].1, DeviceState::Device));
+        assert!(matches!(listed[1].1, DeviceState::Offline));
+        assert!(matches!(listed[2].1, DeviceState::NoPerm));
     }
 
     #[test]

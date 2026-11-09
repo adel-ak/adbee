@@ -1,9 +1,8 @@
 use crate::Result;
-use adb_client::server::{ADBServer, DeviceState};
+use adb_client::server::DeviceState;
 use mdns_sd::{ResolvedService, ScopedIp, ServiceDaemon, ServiceEvent};
 use rand::Rng;
 use std::net::{IpAddr, SocketAddr, SocketAddrV6};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 const PAIRING: &str = "_adb-tls-pairing._tcp.local.";
@@ -63,25 +62,9 @@ fn best_addr(svc: &ResolvedService) -> Result<SocketAddr> {
         .ok_or_else(|| "the phone didn't announce an IP address".into())
 }
 
-/// Run `adb`. It doesn't reliably exit non-zero on failure, so success means its output contains `ok`.
-// ponytail: adb CLI instead of adb_client here, because adb_client's pair/connect take IPv4 only
-fn adb(args: &[&str], ok: &str) -> Result<String> {
-    let out = Command::new("adb")
-        .args(args)
-        .output()
-        .map_err(|e| format!("couldn't run adb (is it on your PATH?): {e}"))?;
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let text = text.trim().to_string();
-    if text.contains(ok) { Ok(text) } else { Err(text.into()) }
-}
-
 fn pair_at(addr: SocketAddr, code: &str) -> Result<()> {
     println!("Pairing with {addr}...");
-    adb(&["pair", &addr.to_string(), code], "Successfully paired")?;
+    crate::adb(&["pair", &addr.to_string(), code], "Successfully paired")?;
     println!("Paired: {addr}");
     Ok(())
 }
@@ -147,7 +130,7 @@ fn connect_discovered(ip: Option<IpAddr>, wait: Duration) -> Result<()> {
     let name = svc.get_fullname().trim_end_matches(".local.");
     let deadline = Instant::now() + wait;
     loop {
-        if ADBServer::default().devices()?.iter().any(|d| d.identifier == name && matches!(d.state, DeviceState::Device)) {
+        if crate::device::list()?.iter().any(|(s, state)| s == name && matches!(state, DeviceState::Device)) {
             println!("Connected: {name}");
             return Ok(());
         }
@@ -161,7 +144,7 @@ fn connect_discovered(ip: Option<IpAddr>, wait: Duration) -> Result<()> {
 
 fn connect_at(addr: SocketAddr) -> Result<()> {
     // "connected to" also matches "already connected to", not "failed to connect to".
-    let out = adb(&["connect", &addr.to_string()], "connected to").map_err(|e| {
+    let out = crate::adb(&["connect", &addr.to_string()], "connected to").map_err(|e| {
         // Most often the phone forgot this computer (wireless debugging toggled, pairings
         // revoked); adb only logs that as a TLS error, so say what to do.
         format!("{e}\nIf the phone was paired before, it may have forgotten this computer: pair again with `adbee`")
@@ -175,7 +158,7 @@ pub fn disconnect(target: Option<&str>) -> Result<()> {
     let mut args = vec!["disconnect"];
     args.extend(target);
     // Prints "disconnected <target>" or "disconnected everything".
-    println!("{}", adb(&args, "disconnected")?);
+    println!("{}", crate::adb(&args, "disconnected")?);
     Ok(())
 }
 

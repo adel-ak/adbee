@@ -139,6 +139,23 @@ fn complete_serial<P>(_: &P, _: &CompleteCtx<'_>) -> Vec<Candidate<'static>> {
     device::complete_serials().into_iter().map(|(serial, model)| Candidate::described(serial, model)).collect()
 }
 
+/// Run `adb`. It doesn't reliably exit non-zero on failure, so success means its output contains `ok`.
+// ponytail: the adb CLI where adb_client falls short: its pair/connect take IPv4 only, and its
+// `adb devices` parser rejects serials with spaces
+pub fn adb(args: &[&str], ok: &str) -> Result<String> {
+    let out = std::process::Command::new("adb")
+        .args(args)
+        .output()
+        .map_err(|e| format!("couldn't run adb (is it on your PATH?): {e}"))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = text.trim().to_string();
+    if text.contains(ok) { Ok(text) } else { Err(text.into()) }
+}
+
 fn main() {
     if let Err(e) = run(Adbee::parse()) {
         eprintln!("adbee: {e}");
